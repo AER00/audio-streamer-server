@@ -4,6 +4,11 @@ use std::net::UdpSocket;
 use std::process::{Command, Stdio};
 use std::str::from_utf8;
 use std::time::Duration;
+use byteorder::{ByteOrder, LittleEndian};
+
+const DATA_SILENCE: u8 = 0;
+// const DATA_SOUND: u8 = 1;
+const DATA_CONFIG: u8 = 2;
 
 struct Handler {
     process: std::process::Child,
@@ -20,14 +25,16 @@ impl Handler {
 
         let size = socket.recv(&mut *buf)?;
 
-        let conf_str = from_utf8(&buf[..size]).unwrap_or("");
-        let conf: Vec<&str> = conf_str.trim().split(" ").collect();
+        if buf[0] == DATA_CONFIG {
+            let conf_str = from_utf8(&buf[1..size]).unwrap_or("");
+            let conf: Vec<&str> = conf_str.trim().split(" ").collect();
 
-        if conf.len() == 3 {
-            println!("{:?}", conf);
-            format = conf[0];
-            rate = conf[1];
-            buf_size = conf[2];
+            if conf.len() == 3 {
+                println!("{:?}", conf);
+                format = conf[0];
+                rate = conf[1];
+                buf_size = conf[2];
+            }
         }
 
         let process = Command::new("aplay")
@@ -55,20 +62,21 @@ impl Handler {
         let mut stdin = self.process.stdin.take().unwrap();
 
         loop {
-            let size = socket.recv(&mut *buf)?;
+            let mut size = socket.recv(&mut *buf)?;
             if size == 0 {
                 return Ok(())
             }
 
-            if size <= 32 {
-                if let Ok(text) = from_utf8(&buf[..size]) {
-                    if text.trim().split(" ").collect::<Vec<&str>>().len() == 3 {
-                        continue;
-                    }
-                }
+            if buf[0] == DATA_CONFIG {
+                continue;
             }
 
-            stdin.write_all(&buf[..size])?;
+            if buf[0] == DATA_SILENCE {
+                size = LittleEndian::read_u16(&buf[1..3]) as usize;
+                buf[1..size].iter_mut().for_each(|x| *x = 0);
+            }
+
+            stdin.write_all(&buf[1..size])?;
         }
     }
 }
