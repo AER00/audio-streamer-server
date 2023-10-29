@@ -3,15 +3,24 @@ use std::io::Write;
 use std::net::UdpSocket;
 use std::process::{Command, Stdio};
 use std::str::from_utf8;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use byteorder::{ByteOrder, LittleEndian};
 
 const DATA_SILENCE: u8 = 0;
-// const DATA_SOUND: u8 = 1;
+const DATA_SOUND: u8 = 1;
 const DATA_CONFIG: u8 = 2;
+const DATA_FILLED: u8 = 3;
 
 struct Handler {
     process: std::process::Child,
+    buffer: usize,
+    frequency: usize,
+    fill: bool
+}
+
+fn optimal_read_timeout(chunk_size: usize, frequency: usize) -> Duration {
+    let ms = ((chunk_size as f64 * 1000.0 / 8.0) / frequency as f64).ceil() as u64;
+    Duration::from_millis(ms)
 }
 
 impl Handler {
@@ -19,6 +28,7 @@ impl Handler {
         let mut format = "S32_LE";
         let mut rate = "44100";
         let mut buf_size = "1888";
+        let mut fill = true;
 
         let mut buf = vec![0u8; 256];
         socket.set_read_timeout(None)?;
@@ -29,13 +39,19 @@ impl Handler {
             let conf_str = from_utf8(&buf[1..size]).unwrap_or("");
             let conf: Vec<&str> = conf_str.trim().split(" ").collect();
 
-            if conf.len() == 3 {
+            if conf.len() >= 3 {
                 println!("{:?}", conf);
                 format = conf[0];
                 rate = conf[1];
                 buf_size = conf[2];
+                if conf.len() == 4 && conf[3] == "false" {
+                    fill = false;
+                }
             }
         }
+
+        let buffer: usize = buf_size.parse()?;
+        let frequency: usize = rate.parse()?;
 
         let process = Command::new("aplay")
             .arg("--buffer-size")
@@ -50,21 +66,53 @@ impl Handler {
             .spawn()?;
 
         Ok(Handler {
-            process
+            process,
+            buffer,
+            frequency,
+            fill,
         })
     }
 
     fn handle(mut self, socket: &UdpSocket) -> io::Result<()> {
         let mut buf = vec![0u8; 16384];
 
-        socket.set_read_timeout(Some(Duration::from_secs(1)))?;
-
         let mut stdin = self.process.stdin.take().unwrap();
 
+        // fill buffer with silence
+        buf[..self.buffer].iter_mut().for_each(|x| *x = 0);
+        stdin.write_all(&buf[..self.buffer])?;
+
+        socket.set_read_timeout(Some(Duration::from_millis(1000)))?;
+
+        // maximum no packet timeout
+        let mut max_silence = Duration::from_millis(1500);
+
+        let mut optimal_timeout = true;
+
+        let mut chunk_size = self.buffer;
+
+        if self.fill {
+            max_silence = Duration::from_millis(1000);
+            optimal_timeout = false;
+            socket.set_read_timeout(Some(optimal_read_timeout(chunk_size, self.frequency)))?;
+        }
+
+        let mut last = Instant::now();
+
         loop {
-            let mut size = socket.recv(&mut *buf)?;
-            if size == 0 {
-                return Ok(())
+            let mut size = socket.recv(&mut *buf).unwrap_or(0);
+            let duration = last.elapsed();
+
+            if duration > max_silence {
+                return Ok(());
+            }
+
+            if size > 0 {
+                last = Instant::now();
+            } else if self.fill {
+                buf[0] = DATA_SOUND;
+                size = chunk_size + 1;
+                buf[1..size].iter_mut().for_each(|x| *x = 0);
             }
 
             if buf[0] == DATA_CONFIG {
@@ -74,6 +122,14 @@ impl Handler {
             if buf[0] == DATA_SILENCE {
                 size = LittleEndian::read_u16(&buf[1..3]) as usize;
                 buf[1..size].iter_mut().for_each(|x| *x = 0);
+            }
+
+            // set read timeout to optimal time based on regular chunk size
+            // (will never execute when fill is set to false)
+            if !optimal_timeout && buf[0] != DATA_FILLED {
+                chunk_size = size - 1;
+                socket.set_read_timeout(Some(optimal_read_timeout(chunk_size, self.frequency)))?;
+                optimal_timeout = true;
             }
 
             stdin.write_all(&buf[1..size])?;
