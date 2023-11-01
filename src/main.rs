@@ -1,34 +1,27 @@
-use std::io;
-use std::io::Write;
-use std::net::UdpSocket;
-use std::process::{Command, Stdio};
-use std::str::from_utf8;
-use std::time::{Duration, Instant};
+use alsa::pcm::{Access, Format, Frames, HwParams, PCM};
+use alsa::{Direction, ValueOr};
 use byteorder::{ByteOrder, LittleEndian};
+use kanal::bounded;
+use kanal::{Receiver, Sender};
+use std::net::UdpSocket;
+use std::str::from_utf8;
+use std::thread;
+use std::time::Duration;
 
 const DATA_SILENCE: u8 = 0;
-// const DATA_SOUND: u8 = 1;
 const DATA_CONFIG: u8 = 2;
-// const DATA_FILLED: u8 = 3;
 
 struct Handler {
-    process: std::process::Child,
     buffer: usize,
     frequency: usize,
-    fill: bool
-}
-
-fn optimal_read_timeout(chunk_size: usize, frequency: usize) -> Duration {
-    let ms = ((chunk_size as f64 * 1000.0 / 8.0) / frequency as f64).ceil() as u64;
-    Duration::from_millis(ms)
+    sender: Sender<i32>,
 }
 
 impl Handler {
-    fn new(socket: &UdpSocket) -> anyhow::Result<Handler> {
-        let mut format = "S32_LE";
-        let mut rate = "44100";
-        let mut buf_size = "1888";
-        let mut fill = true;
+    fn new(socket: &UdpSocket) -> anyhow::Result<(Handler, Receiver<i32>)> {
+        let mut format = 32;
+        let mut frequency = 44100;
+        let mut buffer = 2048;
 
         let mut buf = vec![0u8; 256];
         socket.set_read_timeout(None)?;
@@ -39,78 +32,49 @@ impl Handler {
             let conf_str = from_utf8(&buf[1..size]).unwrap_or("");
             let conf: Vec<&str> = conf_str.trim().split(" ").collect();
 
-            if conf.len() >= 3 {
-                println!("{:?}", conf);
-                format = conf[0];
-                rate = conf[1];
-                buf_size = conf[2];
-                if conf.len() == 4 && conf[3] == "false" {
-                    fill = false;
-                }
+            if conf.len() == 3 {
+                format = conf[0].parse().unwrap_or(format);
+                frequency = conf[1].parse().unwrap_or(frequency);
+                buffer = conf[2].parse().unwrap_or(buffer);
             }
         }
 
-        let buffer: usize = buf_size.parse()?;
-        let frequency: usize = rate.parse()?;
+        println!("sample rate: {format}; frequency: {frequency} Hz; buffer: {buffer} frames");
 
-        let process = Command::new("aplay")
-            .arg("--buffer-size")
-            .arg(buf_size)
-            .arg("-r")
-            .arg(rate)
-            .arg("-f")
-            .arg(format)
-            .arg("-c")
-            .arg("2")
-            .stdin(Stdio::piped())
-            .spawn()?;
+        let (sender, receiver) = bounded(16384);
 
-        Ok(Handler {
-            process,
-            buffer,
-            frequency,
-            fill,
-        })
+        Ok((
+            Handler {
+                buffer,
+                frequency,
+                sender,
+            },
+            receiver,
+        ))
     }
 
-    fn handle(mut self, socket: &UdpSocket) -> io::Result<()> {
+    fn handle(mut self, socket: &UdpSocket, receiver: Receiver<i32>) -> anyhow::Result<()> {
         let mut buf = vec![0u8; 16384];
-
-        let mut stdin = self.process.stdin.take().unwrap();
-
-        // fill buffer with silence
-        buf[..self.buffer].iter_mut().for_each(|x| *x = 0);
-        stdin.write_all(&buf[..self.buffer])?;
 
         socket.set_read_timeout(Some(Duration::from_millis(1000)))?;
 
-        // maximum no packet timeout
-        let mut max_silence = Duration::from_millis(1500);
+        let rate = self.frequency;
+        let buffer = self.buffer;
 
-        if self.fill {
-            max_silence = Duration::from_millis(1000);
-            socket.set_read_timeout(Some(optimal_read_timeout(self.buffer, self.frequency)))?;
-        }
-
-        let zeroes = vec![0u8; self.buffer];
-
-        let mut last = Instant::now();
+        thread::spawn(move || {
+            if let Err(e) = playback(receiver, rate, buffer) {
+                eprintln!("{}", e);
+            }
+        });
 
         loop {
-            let mut size = socket.recv(&mut *buf).unwrap_or(0);
-            let duration = last.elapsed();
-
-            if duration > max_silence {
+            if self.sender.is_disconnected() {
                 return Ok(());
             }
 
-            if size > 0 {
-                last = Instant::now();
-            } else if self.fill {
-                // stdin.write_all(&buf[1..(self.buffer+1)])?;
-                stdin.write_all(&zeroes)?;
-                continue;
-            } else {
+            let mut size = socket.recv(&mut *buf)?;
+
+            if size == 0 {
                 return Ok(());
             }
 
@@ -120,47 +84,99 @@ impl Handler {
 
             if buf[0] == DATA_SILENCE {
                 size = LittleEndian::read_u16(&buf[1..3]) as usize;
-                buf[1..size].iter_mut().for_each(|x| *x = 0);
+                let iters = (size - 1) / 4;
+                for _ in 0..iters {
+                    self.sender.send(0)?;
+                }
+                continue;
             }
 
-            // // set read timeout to optimal time based on regular chunk size
-            // // (will never execute when fill is set to false)
-            // if !optimal_timeout && buf[0] != DATA_FILLED {
-            //     chunk_size = size - 1;
-            //     socket.set_read_timeout(Some(optimal_read_timeout(self.buffer, self.frequency)))?;
-            //     optimal_timeout = true;
-            // }
-
-            stdin.write_all(&buf[1..size])?;
+            for chunk in buf[1..size].chunks_exact(4) {
+                self.sender.send(LittleEndian::read_i32(chunk))?;
+            }
         }
     }
 }
 
 impl Drop for Handler {
     fn drop(&mut self) {
-        let _ = self.process.wait();
+        self.sender.close();
     }
 }
 
-fn main() -> io::Result<()> {
+fn playback(receiver: Receiver<i32>, rate: usize, buffer: usize) -> anyhow::Result<()> {
+    let pcm = PCM::new("default", Direction::Playback, false)?;
+
+    let hwp = HwParams::any(&pcm)?;
+    hwp.set_channels(2)?;
+    hwp.set_rate(rate as u32, ValueOr::Nearest)?;
+    hwp.set_format(Format::s32())?;
+    hwp.set_access(Access::RWInterleaved)?;
+    hwp.set_buffer_size_near(Frames::from(buffer as i32))?;
+    pcm.hw_params(&hwp)?;
+    let io = pcm.io_i32()?;
+
+    let hwp = pcm.hw_params_current()?;
+    let swp = pcm.sw_params_current()?;
+
+    let threshold = hwp.get_buffer_size()?;
+    swp.set_start_threshold(threshold)?;
+    pcm.sw_params(&swp)?;
+
+    const PLAYBACK_SIZE: usize = 8;
+    let mut playback = [0i32; PLAYBACK_SIZE];
+
+    let buffer = threshold as usize;
+    let mut filled = false;
+    let mut started = false;
+    let mut written = 0;
+
+    loop {
+        if receiver.is_terminated() {
+            if started {
+                pcm.drain()?;
+            }
+            return Ok(());
+        }
+
+        for sample in playback.iter_mut() {
+            if started && (receiver.is_empty() || filled) {
+                *sample = 0;
+                // we want to write samples in pairs not to reverse the channels
+                filled = !filled;
+            } else {
+                *sample = receiver.recv()?;
+            }
+        }
+
+        io.writei(&playback)?;
+
+        if !started {
+            written += PLAYBACK_SIZE;
+            started = written >= buffer;
+        }
+    }
+}
+
+fn main() -> anyhow::Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:9032")?;
 
     let sleep_time = Duration::from_secs(1);
 
     loop {
-        std::thread::sleep(sleep_time);
+        thread::sleep(sleep_time);
         println!("waiting...");
 
-        let handler = match Handler::new(&socket) {
-            Ok(handler) => handler,
+        let (handler, receiver) = match Handler::new(&socket) {
+            Ok((h, r)) => (h, r),
             Err(e) => {
-                println!("starting handler error: {}", e);
+                eprintln!("starting handler error: {}", e);
                 continue;
             }
         };
 
-        if let Err(e) = handler.handle(&socket) {
-            println!("handler error: {}", e);
+        if let Err(e) = handler.handle(&socket, receiver) {
+            eprintln!("handler error: {}", e);
         }
     }
 }

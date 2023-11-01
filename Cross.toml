@@ -1,0 +1,5 @@
+[target.aarch64-unknown-linux-gnu]
+dockerfile = "/home/aero/Projects/cross/alsa-android/Dockerfile"
+
+[target.aarch64-unknown-linux-musl]
+dockerfile = "/home/aero/Projects/cross/alsa-android/Dockerfile"

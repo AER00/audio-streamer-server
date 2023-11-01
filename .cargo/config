@@ -1,2 +1,5 @@
 [target.mipsel-unknown-linux-musl]
 linker = "mipsel-openwrt-linux-gcc"
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static", "-L", "/usr/aarch64-linux-musl/lib", "-l", "static=asound"]

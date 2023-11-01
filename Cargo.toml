@@ -9,6 +9,7 @@ edition = "2021"
 alsa = "0.8.1"
 anyhow = "1.0.66"
 byteorder = "1.4.3"
+kanal = "0.1.0-pre8"
 
 [profile.release]
 strip = true
