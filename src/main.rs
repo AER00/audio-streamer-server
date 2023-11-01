@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use byteorder::{ByteOrder, LittleEndian};
 
 const DATA_SILENCE: u8 = 0;
-const DATA_SOUND: u8 = 1;
+// const DATA_SOUND: u8 = 1;
 const DATA_CONFIG: u8 = 2;
-const DATA_FILLED: u8 = 3;
+// const DATA_FILLED: u8 = 3;
 
 struct Handler {
     process: std::process::Child,
@@ -87,15 +87,12 @@ impl Handler {
         // maximum no packet timeout
         let mut max_silence = Duration::from_millis(1500);
 
-        let mut optimal_timeout = true;
-
-        let mut chunk_size = self.buffer;
-
         if self.fill {
             max_silence = Duration::from_millis(1000);
-            optimal_timeout = false;
-            socket.set_read_timeout(Some(optimal_read_timeout(chunk_size, self.frequency)))?;
+            socket.set_read_timeout(Some(optimal_read_timeout(self.buffer, self.frequency)))?;
         }
+
+        let zeroes = vec![0u8; self.buffer];
 
         let mut last = Instant::now();
 
@@ -110,9 +107,11 @@ impl Handler {
             if size > 0 {
                 last = Instant::now();
             } else if self.fill {
-                buf[0] = DATA_SOUND;
-                size = chunk_size + 1;
-                buf[1..size].iter_mut().for_each(|x| *x = 0);
+                // stdin.write_all(&buf[1..(self.buffer+1)])?;
+                stdin.write_all(&zeroes)?;
+                continue;
+            } else {
+                return Ok(());
             }
 
             if buf[0] == DATA_CONFIG {
@@ -124,13 +123,13 @@ impl Handler {
                 buf[1..size].iter_mut().for_each(|x| *x = 0);
             }
 
-            // set read timeout to optimal time based on regular chunk size
-            // (will never execute when fill is set to false)
-            if !optimal_timeout && buf[0] != DATA_FILLED {
-                chunk_size = size - 1;
-                socket.set_read_timeout(Some(optimal_read_timeout(chunk_size, self.frequency)))?;
-                optimal_timeout = true;
-            }
+            // // set read timeout to optimal time based on regular chunk size
+            // // (will never execute when fill is set to false)
+            // if !optimal_timeout && buf[0] != DATA_FILLED {
+            //     chunk_size = size - 1;
+            //     socket.set_read_timeout(Some(optimal_read_timeout(self.buffer, self.frequency)))?;
+            //     optimal_timeout = true;
+            // }
 
             stdin.write_all(&buf[1..size])?;
         }
