@@ -1,8 +1,9 @@
-use alsa::pcm::{Access, Format, Frames, HwParams, PCM};
-use alsa::{Direction, ValueOr};
+mod playback;
+
 use byteorder::{ByteOrder, LittleEndian};
 use kanal::bounded;
 use kanal::{Receiver, Sender};
+use playback::{SampleFormat, SAMPLE_BYTES};
 use std::net::UdpSocket;
 use std::str::from_utf8;
 use std::thread;
@@ -14,7 +15,7 @@ const DATA_CONFIG: u8 = 2;
 struct Handler {
     buffer: usize,
     frequency: usize,
-    sender: Sender<i32>,
+    sender: Sender<SampleFormat>,
 }
 
 impl Handler {
@@ -39,7 +40,7 @@ impl Handler {
             }
         }
 
-        println!("sample rate: {format}; frequency: {frequency} Hz; buffer: {buffer} frames");
+        println!("bit depth: {format}; frequency: {frequency} Hz; buffer: {buffer} frames");
 
         let (sender, receiver) = bounded(16384);
 
@@ -53,7 +54,7 @@ impl Handler {
         ))
     }
 
-    fn handle(mut self, socket: &UdpSocket, receiver: Receiver<i32>) -> anyhow::Result<()> {
+    fn handle(self, socket: &UdpSocket, receiver: Receiver<i32>) -> anyhow::Result<()> {
         let mut buf = vec![0u8; 16384];
 
         socket.set_read_timeout(Some(Duration::from_millis(1000)))?;
@@ -62,10 +63,16 @@ impl Handler {
         let buffer = self.buffer;
 
         thread::spawn(move || {
-            if let Err(e) = playback(receiver, rate, buffer) {
+            if let Err(e) = playback::playback(receiver, rate, buffer) {
                 eprintln!("{}", e);
             }
         });
+
+        socket.set_nonblocking(true)?;
+        while !socket.recv(&mut *buf).is_err() {
+            continue;
+        }
+        socket.set_nonblocking(false)?;
 
         loop {
             if self.sender.is_disconnected() {
@@ -83,77 +90,21 @@ impl Handler {
             }
 
             if buf[0] == DATA_SILENCE {
+                if self.sender.len() > self.buffer {
+                    continue;
+                }
                 size = LittleEndian::read_u16(&buf[1..3]) as usize;
-                let iters = (size - 1) / 4;
+
+                let iters = (size - 1) / SAMPLE_BYTES;
                 for _ in 0..iters {
                     self.sender.send(0)?;
                 }
                 continue;
             }
 
-            for chunk in buf[1..size].chunks_exact(4) {
+            for chunk in buf[1..size].chunks_exact(SAMPLE_BYTES) {
                 self.sender.send(LittleEndian::read_i32(chunk))?;
             }
-        }
-    }
-}
-
-impl Drop for Handler {
-    fn drop(&mut self) {
-        self.sender.close();
-    }
-}
-
-fn playback(receiver: Receiver<i32>, rate: usize, buffer: usize) -> anyhow::Result<()> {
-    let pcm = PCM::new("default", Direction::Playback, false)?;
-
-    let hwp = HwParams::any(&pcm)?;
-    hwp.set_channels(2)?;
-    hwp.set_rate(rate as u32, ValueOr::Nearest)?;
-    hwp.set_format(Format::s32())?;
-    hwp.set_access(Access::RWInterleaved)?;
-    hwp.set_buffer_size_near(Frames::from(buffer as i32))?;
-    pcm.hw_params(&hwp)?;
-    let io = pcm.io_i32()?;
-
-    let hwp = pcm.hw_params_current()?;
-    let swp = pcm.sw_params_current()?;
-
-    let threshold = hwp.get_buffer_size()?;
-    swp.set_start_threshold(threshold)?;
-    pcm.sw_params(&swp)?;
-
-    const PLAYBACK_SIZE: usize = 8;
-    let mut playback = [0i32; PLAYBACK_SIZE];
-
-    let buffer = threshold as usize;
-    let mut filled = false;
-    let mut started = false;
-    let mut written = 0;
-
-    loop {
-        if receiver.is_terminated() {
-            if started {
-                pcm.drain()?;
-            }
-            return Ok(());
-        }
-
-        for sample in playback.iter_mut() {
-            if started && (receiver.is_empty() || filled) {
-                *sample = 0;
-                // we want to write samples in pairs not to reverse the channels
-                filled = !filled;
-            } else {
-                *sample = receiver.recv()?;
-            }
-        }
-
-        io.writei(&playback)?;
-
-        if !started {
-            written += PLAYBACK_SIZE;
-            started = written >= buffer;
         }
     }
 }
