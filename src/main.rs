@@ -1,3 +1,4 @@
+mod codec;
 mod playback;
 
 use byteorder::{ByteOrder, LittleEndian};
@@ -42,6 +43,12 @@ fn parse_options() -> Options {
     options
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Codec {
+    Pcm,
+    Opus,
+}
+
 #[derive(Clone)]
 struct Config {
     version: u8,
@@ -49,6 +56,7 @@ struct Config {
     frequency: usize,
     buffer: usize,
     channels: usize,
+    codec: Codec,
 }
 
 impl Default for Config {
@@ -59,6 +67,7 @@ impl Default for Config {
             frequency: 44100,
             buffer: 2048,
             channels: playback::CHANNELS,
+            codec: Codec::Pcm,
         }
     }
 }
@@ -70,7 +79,7 @@ fn parse_config(payload: &[u8]) -> Config {
     let conf: Vec<&str> = conf_str.split_whitespace().collect();
 
     if conf.len() >= 5 {
-        // v2: version bits rate buffer channels
+        // v2: version bits rate buffer channels [codec]
         config.version = conf[0].parse().unwrap_or(2);
         config.bits = conf[1].parse().unwrap_or(config.bits);
         config.frequency = conf[2].parse().unwrap_or(config.frequency);
@@ -81,6 +90,13 @@ fn parse_config(payload: &[u8]) -> Config {
         config.bits = conf[0].parse().unwrap_or(config.bits);
         config.frequency = conf[1].parse().unwrap_or(config.frequency);
         config.buffer = conf[2].parse().unwrap_or(config.buffer);
+    }
+
+    if conf.len() >= 6 {
+        config.codec = match conf[5].to_ascii_lowercase().as_str() {
+            "opus" => Codec::Opus,
+            _ => Codec::Pcm,
+        };
     }
 
     config
@@ -126,16 +142,18 @@ fn enqueue<S: playback::BackendSample>(
     Ok(())
 }
 
-fn handle<S: playback::BackendSample>(
+fn handle<S: playback::BackendSample + From<i16>>(
     socket: &UdpSocket,
     config: &Config,
     latency_ms: u64,
+    mut decoder: Option<&mut codec::Decoder>,
 ) -> anyhow::Result<()> {
     let mut buf = vec![0u8; 16384];
 
     let rate = config.frequency;
     let buffer = config.buffer;
     let channels = config.channels;
+    let mut pcm = vec![0i16; codec::MAX_FRAME_SAMPLES * channels];
 
     // v1 packets have only the tag byte; v2 adds the sequence number.
     let header = if config.version >= 2 { HEADER_SIZE } else { 1 };
@@ -198,6 +216,8 @@ fn handle<S: playback::BackendSample>(
             continue;
         }
 
+        let mut lost: u32 = 0;
+
         if config.version >= 2 {
             let seq = LittleEndian::read_u32(&buf[1..HEADER_SIZE]);
             if let Some(expected) = expected_seq {
@@ -206,10 +226,24 @@ fn handle<S: playback::BackendSample>(
                     // Ignore nonsense (reordered old packets, sender restarts).
                     if gap < 512 {
                         gaps += gap as u64;
+                        lost = gap;
                     }
                 }
             }
             expected_seq = Some(seq.wrapping_add(1));
+        }
+
+        // Opus can synthesise the missing frames instead of leaving a hole.
+        if lost > 0 {
+            if let Some(decoder) = decoder.as_deref_mut() {
+                for _ in 0..lost.min(5) {
+                    let samples = decoder.decode(None, &mut pcm)?;
+                    let end = (samples * channels).min(pcm.len());
+                    for &sample in &pcm[..end] {
+                        enqueue(&sender, S::from(sample), &mut dropped)?;
+                    }
+                }
+            }
         }
 
         if buf[0] == DATA_SILENCE {
@@ -235,6 +269,15 @@ fn handle<S: playback::BackendSample>(
             continue;
         }
 
+        if let Some(decoder) = decoder.as_deref_mut() {
+            let samples = decoder.decode(Some(&buf[header..size]), &mut pcm)?;
+            let end = (samples * channels).min(pcm.len());
+            for &sample in &pcm[..end] {
+                enqueue(&sender, S::from(sample), &mut dropped)?;
+            }
+            continue;
+        }
+
         for chunk in buf[header..size].chunks_exact(S::BYTES) {
             enqueue(&sender, S::read_le(chunk), &mut dropped)?;
         }
@@ -252,7 +295,7 @@ fn main() -> anyhow::Result<()> {
         thread::sleep(sleep_time);
         println!("waiting...");
 
-        let config = match read_config(&socket, last_config.as_ref()) {
+        let mut config = match read_config(&socket, last_config.as_ref()) {
             Ok(config) => config,
             Err(e) => {
                 eprintln!("starting handler error: {}", e);
@@ -260,11 +303,24 @@ fn main() -> anyhow::Result<()> {
             }
         };
 
+        // Opus is fixed-rate stereo 16-bit at the decoder output.
+        if config.codec == Codec::Opus {
+            config.bits = 16;
+            config.frequency = codec::RATE as usize;
+            config.channels = codec::CHANNELS;
+        }
+
         last_config = Some(config.clone());
 
+        let codec_name = match config.codec {
+            Codec::Pcm => "pcm",
+            Codec::Opus => "opus",
+        };
+
         println!(
-            "protocol v{}; bit depth: {}; frequency: {} Hz; buffer: {} frames; channels: {}; latency: {} ms",
+            "protocol v{}; codec: {}; bit depth: {}; frequency: {} Hz; buffer: {} frames; channels: {}; latency: {} ms",
             config.version,
+            codec_name,
             config.bits,
             config.frequency,
             config.buffer,
@@ -272,10 +328,22 @@ fn main() -> anyhow::Result<()> {
             options.latency_ms
         );
 
-        let result = if config.bits == 16 {
-            handle::<i16>(&socket, &config, options.latency_ms)
+        let mut decoder = if config.codec == Codec::Opus {
+            match codec::Decoder::new(config.channels) {
+                Ok(decoder) => Some(decoder),
+                Err(e) => {
+                    eprintln!("cannot start opus playback: {}", e);
+                    continue;
+                }
+            }
         } else {
-            handle::<i32>(&socket, &config, options.latency_ms)
+            None
+        };
+
+        let result = if config.bits == 16 {
+            handle::<i16>(&socket, &config, options.latency_ms, decoder.as_mut())
+        } else {
+            handle::<i32>(&socket, &config, options.latency_ms, decoder.as_mut())
         };
 
         if let Err(e) = result {
@@ -319,5 +387,33 @@ mod tests {
     fn rejects_zero_channels() {
         let config = parse_config(b"2 16 48000 2048 0");
         assert!(config.channels >= 1);
+    }
+
+    #[test]
+    fn parses_codec() {
+        assert_eq!(parse_config(b"2 16 48000 2048 2 pcm").codec, Codec::Pcm);
+        assert_eq!(parse_config(b"3 16 48000 2048 2 opus").codec, Codec::Opus);
+        assert_eq!(parse_config(b"2 16 48000 2048 2").codec, Codec::Pcm);
+    }
+
+    #[cfg(feature = "opus")]
+    #[test]
+    fn decodes_packets_and_conceals_loss() {
+        let mut encoder =
+            opus::Encoder::new(codec::RATE, opus::Channels::Stereo, opus::Application::Audio)
+                .unwrap();
+        let input = vec![1000i16; codec::FRAME_SAMPLES * codec::CHANNELS];
+        let mut packet = vec![0u8; 4000];
+        let n = encoder.encode(&input, &mut packet).unwrap();
+
+        let mut decoder = codec::Decoder::new(codec::CHANNELS).unwrap();
+        let mut out = vec![0i16; codec::MAX_FRAME_SAMPLES * codec::CHANNELS];
+
+        assert_eq!(
+            decoder.decode(Some(&packet[..n]), &mut out).unwrap(),
+            codec::FRAME_SAMPLES
+        );
+        // One lost frame is concealed at the 20 ms frame size.
+        assert_eq!(decoder.decode(None, &mut out).unwrap(), codec::FRAME_SAMPLES);
     }
 }
