@@ -49,7 +49,7 @@ enum Codec {
     Opus,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct Config {
     version: u8,
     bits: usize,
@@ -102,6 +102,25 @@ fn parse_config(payload: &[u8]) -> Config {
     config
 }
 
+/// Opus is fixed-rate stereo 16-bit at the decoder output, whatever the
+/// client advertised.
+fn normalize(mut config: Config) -> Config {
+    if config.codec == Codec::Opus {
+        config.bits = 16;
+        config.frequency = codec::RATE as usize;
+        config.channels = codec::CHANNELS;
+    }
+    config
+}
+
+/// A config packet only forces a reconfiguration when the effective format
+/// differs. Clients resend their config periodically, so identical repeats
+/// must not tear the playback stream down.
+fn reconfigured(current: &Config, payload: &[u8]) -> Option<Config> {
+    let next = normalize(parse_config(payload));
+    (next != *current).then_some(next)
+}
+
 /// Look for a config packet, ignoring anything else still in flight from a
 /// previous session. Falls back to the previous config if none arrives, so a
 /// client that only announces itself once can still reconnect.
@@ -147,7 +166,7 @@ fn handle<S: playback::BackendSample + From<i16>>(
     config: &Config,
     latency_ms: u64,
     mut decoder: Option<&mut codec::Decoder>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<Config>> {
     let mut buf = vec![0u8; 16384];
 
     let rate = config.frequency;
@@ -180,7 +199,7 @@ fn handle<S: playback::BackendSample + From<i16>>(
 
     loop {
         if sender.is_disconnected() {
-            return Ok(());
+            return Ok(None);
         }
 
         if last_stats.elapsed() >= STATS_INTERVAL {
@@ -205,10 +224,17 @@ fn handle<S: playback::BackendSample + From<i16>>(
         };
 
         if size == 0 {
-            return Ok(());
+            return Ok(None);
         }
 
+        // A client that changes codec or rate announces it mid-session. Only
+        // the effective format matters; periodic identical resends are ignored.
         if buf[0] == DATA_CONFIG {
+            if size >= 2 {
+                if let Some(next) = reconfigured(config, &buf[1..size]) {
+                    return Ok(Some(next));
+                }
+            }
             continue;
         }
 
@@ -303,51 +329,56 @@ fn main() -> anyhow::Result<()> {
             }
         };
 
-        // Opus is fixed-rate stereo 16-bit at the decoder output.
-        if config.codec == Codec::Opus {
-            config.bits = 16;
-            config.frequency = codec::RATE as usize;
-            config.channels = codec::CHANNELS;
-        }
+        // One session runs until the sender disconnects or changes format.
+        loop {
+            config = normalize(config);
+            last_config = Some(config.clone());
 
-        last_config = Some(config.clone());
+            let codec_name = match config.codec {
+                Codec::Pcm => "pcm",
+                Codec::Opus => "opus",
+            };
 
-        let codec_name = match config.codec {
-            Codec::Pcm => "pcm",
-            Codec::Opus => "opus",
-        };
+            println!(
+                "protocol v{}; codec: {}; bit depth: {}; frequency: {} Hz; buffer: {} frames; channels: {}; latency: {} ms",
+                config.version,
+                codec_name,
+                config.bits,
+                config.frequency,
+                config.buffer,
+                config.channels,
+                options.latency_ms
+            );
 
-        println!(
-            "protocol v{}; codec: {}; bit depth: {}; frequency: {} Hz; buffer: {} frames; channels: {}; latency: {} ms",
-            config.version,
-            codec_name,
-            config.bits,
-            config.frequency,
-            config.buffer,
-            config.channels,
-            options.latency_ms
-        );
+            let mut decoder = if config.codec == Codec::Opus {
+                match codec::Decoder::new(config.channels) {
+                    Ok(decoder) => Some(decoder),
+                    Err(e) => {
+                        eprintln!("cannot start opus playback: {}", e);
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
 
-        let mut decoder = if config.codec == Codec::Opus {
-            match codec::Decoder::new(config.channels) {
-                Ok(decoder) => Some(decoder),
+            let result = if config.bits == 16 {
+                handle::<i16>(&socket, &config, options.latency_ms, decoder.as_mut())
+            } else {
+                handle::<i32>(&socket, &config, options.latency_ms, decoder.as_mut())
+            };
+
+            match result {
+                Ok(Some(next)) => {
+                    println!("format changed, reconfiguring");
+                    config = next;
+                }
+                Ok(None) => break,
                 Err(e) => {
-                    eprintln!("cannot start opus playback: {}", e);
-                    continue;
+                    eprintln!("handler error: {}", e);
+                    break;
                 }
             }
-        } else {
-            None
-        };
-
-        let result = if config.bits == 16 {
-            handle::<i16>(&socket, &config, options.latency_ms, decoder.as_mut())
-        } else {
-            handle::<i32>(&socket, &config, options.latency_ms, decoder.as_mut())
-        };
-
-        if let Err(e) = result {
-            eprintln!("handler error: {}", e);
         }
     }
 }
@@ -394,6 +425,20 @@ mod tests {
         assert_eq!(parse_config(b"2 16 48000 2048 2 pcm").codec, Codec::Pcm);
         assert_eq!(parse_config(b"3 16 48000 2048 2 opus").codec, Codec::Opus);
         assert_eq!(parse_config(b"2 16 48000 2048 2").codec, Codec::Pcm);
+    }
+
+    #[test]
+    fn reconfigures_only_when_the_format_changes() {
+        let pcm = normalize(parse_config(b"2 32 44100 2048 2 pcm"));
+        assert!(reconfigured(&pcm, b"2 32 44100 2048 2 pcm").is_none());
+
+        let opus = normalize(parse_config(b"3 16 48000 1024 2 opus"));
+        assert!(reconfigured(&opus, b"3 16 48000 1024 2 opus").is_none());
+
+        let next = reconfigured(&pcm, b"3 16 48000 1024 2 opus").expect("codec change");
+        assert_eq!(next.codec, Codec::Opus);
+        assert_eq!(next.bits, 16);
+        assert_eq!(next.frequency, 48_000);
     }
 
     #[cfg(feature = "opus")]
