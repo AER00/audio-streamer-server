@@ -8,6 +8,16 @@ mod wasapi;
 #[cfg(target_os = "windows")]
 pub use wasapi::playback;
 
+#[cfg(target_os = "macos")]
+mod coreaudio;
+#[cfg(target_os = "macos")]
+pub use coreaudio::playback;
+
+#[cfg(target_os = "macos")]
+pub trait BackendSample: Sample {}
+#[cfg(target_os = "macos")]
+impl<T: Sample> BackendSample for T {}
+
 #[cfg(target_os = "windows")]
 pub trait BackendSample: Sample {}
 #[cfg(target_os = "windows")]
@@ -137,6 +147,9 @@ pub trait Sample: Copy + Send + 'static {
 
     /// Midpoint of two samples, used for the one-frame splice crossfade.
     fn blend(a: Self, b: Self) -> Self;
+
+    /// Normalised value in -1.0..=1.0, used by backends that want f32.
+    fn to_f32(self) -> f32;
 }
 
 impl Sample for i16 {
@@ -158,6 +171,10 @@ impl Sample for i16 {
     fn blend(a: Self, b: Self) -> Self {
         ((a as i32 + b as i32) / 2) as i16
     }
+
+    fn to_f32(self) -> f32 {
+        self as f32 / 32768.0
+    }
 }
 
 impl Sample for i32 {
@@ -178,6 +195,10 @@ impl Sample for i32 {
 
     fn blend(a: Self, b: Self) -> Self {
         ((a as i64 + b as i64) / 2) as i32
+    }
+
+    fn to_f32(self) -> f32 {
+        self as f32 / 2_147_483_648.0
     }
 }
 

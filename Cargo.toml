@@ -21,6 +21,9 @@ alsa = "0.8.1"
 [target.'cfg(target_os = "windows")'.dependencies]
 wasapi = "0.14.0"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = "0.15.3"
+
 [profile.release]
 strip = true
 opt-level = 3
