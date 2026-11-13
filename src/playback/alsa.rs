@@ -1,4 +1,4 @@
-use crate::playback::{Sample, CHANNELS};
+use crate::playback::{Jitter, Sample, CHANNELS};
 use alsa::pcm::{Access, Format, Frames, HwParams, IO, PCM};
 use alsa::{Direction, ValueOr};
 use kanal::Receiver;
@@ -33,6 +33,7 @@ pub fn playback<S: AlsaSample>(
     receiver: Receiver<S>,
     rate: usize,
     buffer: usize,
+    latency_ms: u64,
 ) -> anyhow::Result<()> {
     let pcm = PCM::new("default", Direction::Playback, false)?;
 
@@ -52,13 +53,14 @@ pub fn playback<S: AlsaSample>(
     swp.set_start_threshold(threshold)?;
     pcm.sw_params(&swp)?;
 
+    // Samples per write; must be a multiple of CHANNELS so frames stay whole.
     const PLAYBACK_SIZE: usize = 8;
     let mut playback = [S::zero(); PLAYBACK_SIZE];
+    let mut jitter = Jitter::new(rate, latency_ms);
 
     let buffer = threshold as usize;
-    let mut filled = false;
     let mut started = false;
-    let mut written = 0;
+    let mut written = 0; // frames
 
     loop {
         if receiver.is_terminated() {
@@ -68,14 +70,11 @@ pub fn playback<S: AlsaSample>(
             return Ok(());
         }
 
-        for sample in playback.iter_mut() {
-            if started && (receiver.is_empty() || filled) {
-                *sample = S::zero();
-                // we want to write samples in pairs not to reverse the channels
-                filled = !filled;
-            } else {
-                *sample = receiver.recv()?;
-            }
+        jitter.set_started(started);
+
+        for i in (0..PLAYBACK_SIZE).step_by(CHANNELS) {
+            let frame = jitter.next_frame(&receiver)?;
+            playback[i..i + CHANNELS].copy_from_slice(&frame);
         }
 
         io.writei(&playback).or_else(|e| -> alsa::Result<usize> {
@@ -84,12 +83,11 @@ pub fn playback<S: AlsaSample>(
             pcm.try_recover(e, true)?;
             started = false;
             written = 0;
-            filled = false;
             Ok(0)
         })?;
 
         if !started {
-            written += PLAYBACK_SIZE;
+            written += PLAYBACK_SIZE / CHANNELS;
             started = written >= buffer;
         }
     }

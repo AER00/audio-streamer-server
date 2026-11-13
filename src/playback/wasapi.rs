@@ -1,4 +1,4 @@
-use crate::playback::{Sample, CHANNELS};
+use crate::playback::{Jitter, Sample, CHANNELS};
 use kanal::Receiver;
 use wasapi::*;
 
@@ -11,6 +11,7 @@ pub fn playback<S: Sample>(
     receiver: Receiver<S>,
     rate: usize,
     _buffer: usize,
+    latency_ms: u64,
 ) -> anyhow::Result<()> {
     checked(initialize_mta())?;
 
@@ -68,7 +69,8 @@ pub fn playback<S: Sample>(
 
     checked(audio_client.start_stream())?;
 
-    let mut flipped = false;
+    let mut jitter = Jitter::new(rate, latency_ms);
+    jitter.set_started(true);
 
     loop {
         if receiver.is_terminated() {
@@ -79,12 +81,10 @@ pub fn playback<S: Sample>(
 
         let size = (buffer_frame_count as usize * blockalign as usize).min(buf.len());
 
-        for samples in buf[..size].chunks_exact_mut(S::BYTES) {
-            if receiver.is_empty() || flipped {
-                flipped = !flipped;
-                samples.iter_mut().for_each(|x| *x = 0);
-            } else {
-                receiver.recv()?.write_le(samples);
+        for frame in buf[..size].chunks_exact_mut(blockalign as usize) {
+            let samples = jitter.next_frame(&receiver)?;
+            for (i, sample) in samples.iter().enumerate() {
+                (*sample).write_le(&mut frame[i * S::BYTES..(i + 1) * S::BYTES]);
             }
         }
 

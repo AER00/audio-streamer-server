@@ -15,6 +15,33 @@ const DATA_CONFIG: u8 = 2;
 const HEADER_SIZE: usize = 5;
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
+struct Options {
+    latency_ms: u64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options { latency_ms: 40 }
+    }
+}
+
+fn parse_options() -> Options {
+    let mut options = Options::default();
+    let mut args = std::env::args().skip(1);
+
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--latency=") {
+            options.latency_ms = value.parse().unwrap_or(options.latency_ms);
+        } else if arg == "--latency" {
+            if let Some(value) = args.next() {
+                options.latency_ms = value.parse().unwrap_or(options.latency_ms);
+            }
+        }
+    }
+
+    options
+}
+
 #[derive(Clone)]
 struct Config {
     version: u8,
@@ -98,6 +125,7 @@ fn enqueue<S: playback::BackendSample>(
 fn handle<S: playback::BackendSample>(
     socket: &UdpSocket,
     config: &Config,
+    latency_ms: u64,
 ) -> anyhow::Result<()> {
     let mut buf = vec![0u8; 16384];
 
@@ -109,10 +137,10 @@ fn handle<S: playback::BackendSample>(
     let header = if config.version >= 2 { HEADER_SIZE } else { 1 };
     let silence_header = header + 2;
 
-    let (sender, receiver) = bounded(16384);
+    let (sender, receiver) = bounded(playback::QUEUE_CAPACITY);
 
     thread::spawn(move || {
-        if let Err(e) = playback::playback(receiver, rate, buffer) {
+        if let Err(e) = playback::playback(receiver, rate, buffer, latency_ms) {
             eprintln!("{}", e);
         }
     });
@@ -211,6 +239,7 @@ fn handle<S: playback::BackendSample>(
 
 fn main() -> anyhow::Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:9032")?;
+    let options = parse_options();
 
     let sleep_time = Duration::from_secs(1);
     let mut last_config: Option<Config> = None;
@@ -230,14 +259,19 @@ fn main() -> anyhow::Result<()> {
         last_config = Some(config.clone());
 
         println!(
-            "protocol v{}; bit depth: {}; frequency: {} Hz; buffer: {} frames; channels: {}",
-            config.version, config.bits, config.frequency, config.buffer, config.channels
+            "protocol v{}; bit depth: {}; frequency: {} Hz; buffer: {} frames; channels: {}; latency: {} ms",
+            config.version,
+            config.bits,
+            config.frequency,
+            config.buffer,
+            config.channels,
+            options.latency_ms
         );
 
         let result = if config.bits == 16 {
-            handle::<i16>(&socket, &config)
+            handle::<i16>(&socket, &config, options.latency_ms)
         } else {
-            handle::<i32>(&socket, &config)
+            handle::<i32>(&socket, &config, options.latency_ms)
         };
 
         if let Err(e) = result {
