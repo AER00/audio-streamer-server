@@ -1,21 +1,39 @@
 mod playback;
 
 use byteorder::{ByteOrder, LittleEndian};
-use kanal::bounded;
+use kanal::{bounded, Sender};
 use std::io::ErrorKind;
 use std::net::UdpSocket;
 use std::str::from_utf8;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DATA_SILENCE: u8 = 0;
 const DATA_CONFIG: u8 = 2;
 
+/// v2 packets start with a tag byte and a u32 LE sequence number.
+const HEADER_SIZE: usize = 5;
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Clone)]
 struct Config {
+    version: u8,
     bits: usize,
     frequency: usize,
     buffer: usize,
+    channels: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            version: 1,
+            bits: 32,
+            frequency: 44100,
+            buffer: 2048,
+            channels: playback::CHANNELS,
+        }
+    }
 }
 
 /// Look for a config packet, ignoring anything else still in flight from a
@@ -32,16 +50,20 @@ fn read_config(socket: &UdpSocket, previous: Option<&Config>) -> anyhow::Result<
                     continue;
                 }
 
-                let mut config = Config {
-                    bits: 32,
-                    frequency: 44100,
-                    buffer: 2048,
-                };
+                let mut config = Config::default();
 
                 let conf_str = from_utf8(&buf[1..size]).unwrap_or("");
-                let conf: Vec<&str> = conf_str.trim().split(" ").collect();
+                let conf: Vec<&str> = conf_str.split_whitespace().collect();
 
-                if conf.len() == 3 {
+                if conf.len() >= 5 {
+                    // v2: version bits rate buffer channels
+                    config.version = conf[0].parse().unwrap_or(2);
+                    config.bits = conf[1].parse().unwrap_or(config.bits);
+                    config.frequency = conf[2].parse().unwrap_or(config.frequency);
+                    config.buffer = conf[3].parse().unwrap_or(config.buffer);
+                    config.channels = conf[4].parse().unwrap_or(config.channels).max(1);
+                } else if conf.len() == 3 {
+                    // v1: bits rate buffer
                     config.bits = conf[0].parse().unwrap_or(config.bits);
                     config.frequency = conf[1].parse().unwrap_or(config.frequency);
                     config.buffer = conf[2].parse().unwrap_or(config.buffer);
@@ -59,6 +81,20 @@ fn read_config(socket: &UdpSocket, previous: Option<&Config>) -> anyhow::Result<
     }
 }
 
+/// Enqueue without blocking the UDP receive loop. A full queue drops samples
+/// and is counted, instead of stalling receives and losing bursts in the
+/// kernel socket buffer.
+fn enqueue<S: playback::BackendSample>(
+    sender: &Sender<S>,
+    sample: S,
+    dropped: &mut u64,
+) -> anyhow::Result<()> {
+    if !sender.try_send(sample)? {
+        *dropped += 1;
+    }
+    Ok(())
+}
+
 fn handle<S: playback::BackendSample>(
     socket: &UdpSocket,
     config: &Config,
@@ -67,6 +103,11 @@ fn handle<S: playback::BackendSample>(
 
     let rate = config.frequency;
     let buffer = config.buffer;
+    let channels = config.channels;
+
+    // v1 packets have only the tag byte; v2 adds the sequence number.
+    let header = if config.version >= 2 { HEADER_SIZE } else { 1 };
+    let silence_header = header + 2;
 
     let (sender, receiver) = bounded(16384);
 
@@ -82,13 +123,30 @@ fn handle<S: playback::BackendSample>(
     }
     socket.set_nonblocking(false)?;
 
+    let mut expected_seq: Option<u32> = None;
+    let mut gaps: u64 = 0;
+    let mut dropped: u64 = 0;
+    let mut last_stats = Instant::now();
+
     loop {
         if sender.is_disconnected() {
             return Ok(());
         }
 
+        if last_stats.elapsed() >= STATS_INTERVAL {
+            if gaps != 0 || dropped != 0 {
+                eprintln!(
+                    "stats: gaps={} dropped={} queued={}",
+                    gaps,
+                    dropped,
+                    sender.len()
+                );
+            }
+            last_stats = Instant::now();
+        }
+
         // A read timeout only means the sender is idle; keep playback alive.
-        let mut size = match socket.recv(&mut *buf) {
+        let size = match socket.recv(&mut *buf) {
             Ok(size) => size,
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                 continue;
@@ -104,22 +162,49 @@ fn handle<S: playback::BackendSample>(
             continue;
         }
 
+        if size < header {
+            continue;
+        }
+
+        if config.version >= 2 {
+            let seq = LittleEndian::read_u32(&buf[1..HEADER_SIZE]);
+            if let Some(expected) = expected_seq {
+                if seq != expected {
+                    let gap = seq.wrapping_sub(expected);
+                    // Ignore nonsense (reordered old packets, sender restarts).
+                    if gap < 512 {
+                        gaps += gap as u64;
+                    }
+                }
+            }
+            expected_seq = Some(seq.wrapping_add(1));
+        }
+
         if buf[0] == DATA_SILENCE {
-            // sender.len() counts samples, buffer is in frames.
-            if sender.len() > buffer * playback::CHANNELS {
+            if size < silence_header {
                 continue;
             }
-            size = LittleEndian::read_u16(&buf[1..3]) as usize;
+            // sender.len() counts samples, buffer is in frames.
+            if sender.len() > buffer * channels {
+                continue;
+            }
 
-            let iters = (size - 1) / S::BYTES;
+            let count = LittleEndian::read_u16(&buf[header..silence_header]) as usize;
+            // v1 counted the tag byte; v2 stores the payload byte count.
+            let iters = if config.version >= 2 {
+                count / S::BYTES
+            } else {
+                count.saturating_sub(1) / S::BYTES
+            };
+
             for _ in 0..iters {
-                sender.send(S::zero())?;
+                enqueue(&sender, S::zero(), &mut dropped)?;
             }
             continue;
         }
 
-        for chunk in buf[1..size].chunks_exact(S::BYTES) {
-            sender.send(S::read_le(chunk))?;
+        for chunk in buf[header..size].chunks_exact(S::BYTES) {
+            enqueue(&sender, S::read_le(chunk), &mut dropped)?;
         }
     }
 }
@@ -145,8 +230,8 @@ fn main() -> anyhow::Result<()> {
         last_config = Some(config.clone());
 
         println!(
-            "bit depth: {}; frequency: {} Hz; buffer: {} frames",
-            config.bits, config.frequency, config.buffer
+            "protocol v{}; bit depth: {}; frequency: {} Hz; buffer: {} frames; channels: {}",
+            config.version, config.bits, config.frequency, config.buffer, config.channels
         );
 
         let result = if config.bits == 16 {
