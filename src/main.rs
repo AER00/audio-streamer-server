@@ -63,6 +63,29 @@ impl Default for Config {
     }
 }
 
+fn parse_config(payload: &[u8]) -> Config {
+    let mut config = Config::default();
+
+    let conf_str = from_utf8(payload).unwrap_or("");
+    let conf: Vec<&str> = conf_str.split_whitespace().collect();
+
+    if conf.len() >= 5 {
+        // v2: version bits rate buffer channels
+        config.version = conf[0].parse().unwrap_or(2);
+        config.bits = conf[1].parse().unwrap_or(config.bits);
+        config.frequency = conf[2].parse().unwrap_or(config.frequency);
+        config.buffer = conf[3].parse().unwrap_or(config.buffer);
+        config.channels = conf[4].parse().unwrap_or(config.channels).max(1);
+    } else if conf.len() == 3 {
+        // v1: bits rate buffer
+        config.bits = conf[0].parse().unwrap_or(config.bits);
+        config.frequency = conf[1].parse().unwrap_or(config.frequency);
+        config.buffer = conf[2].parse().unwrap_or(config.buffer);
+    }
+
+    config
+}
+
 /// Look for a config packet, ignoring anything else still in flight from a
 /// previous session. Falls back to the previous config if none arrives, so a
 /// client that only announces itself once can still reconnect.
@@ -77,26 +100,7 @@ fn read_config(socket: &UdpSocket, previous: Option<&Config>) -> anyhow::Result<
                     continue;
                 }
 
-                let mut config = Config::default();
-
-                let conf_str = from_utf8(&buf[1..size]).unwrap_or("");
-                let conf: Vec<&str> = conf_str.split_whitespace().collect();
-
-                if conf.len() >= 5 {
-                    // v2: version bits rate buffer channels
-                    config.version = conf[0].parse().unwrap_or(2);
-                    config.bits = conf[1].parse().unwrap_or(config.bits);
-                    config.frequency = conf[2].parse().unwrap_or(config.frequency);
-                    config.buffer = conf[3].parse().unwrap_or(config.buffer);
-                    config.channels = conf[4].parse().unwrap_or(config.channels).max(1);
-                } else if conf.len() == 3 {
-                    // v1: bits rate buffer
-                    config.bits = conf[0].parse().unwrap_or(config.bits);
-                    config.frequency = conf[1].parse().unwrap_or(config.frequency);
-                    config.buffer = conf[2].parse().unwrap_or(config.buffer);
-                }
-
-                return Ok(config);
+                return Ok(parse_config(&buf[1..size]));
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
                 if let Some(config) = previous {
@@ -277,5 +281,43 @@ fn main() -> anyhow::Result<()> {
         if let Err(e) = result {
             eprintln!("handler error: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_legacy_config() {
+        let config = parse_config(b"16 48000 2048");
+        assert_eq!(config.version, 1);
+        assert_eq!(config.bits, 16);
+        assert_eq!(config.frequency, 48_000);
+        assert_eq!(config.buffer, 2048);
+        assert_eq!(config.channels, playback::CHANNELS);
+    }
+
+    #[test]
+    fn parses_versioned_config() {
+        let config = parse_config(b"2 16 44100 1024 2");
+        assert_eq!(config.version, 2);
+        assert_eq!(config.bits, 16);
+        assert_eq!(config.frequency, 44_100);
+        assert_eq!(config.buffer, 1024);
+        assert_eq!(config.channels, 2);
+    }
+
+    #[test]
+    fn falls_back_to_defaults_on_garbage() {
+        let config = parse_config(b"nonsense");
+        assert_eq!(config.bits, 32);
+        assert_eq!(config.frequency, 44_100);
+    }
+
+    #[test]
+    fn rejects_zero_channels() {
+        let config = parse_config(b"2 16 48000 2048 0");
+        assert!(config.channels >= 1);
     }
 }
