@@ -1,20 +1,23 @@
-use crate::playback::{SampleFormat, SAMPLE_BYTES};
-use byteorder::ByteOrder;
-use byteorder::LittleEndian;
+use crate::playback::{Sample, CHANNELS};
 use kanal::Receiver;
 use wasapi::*;
 
-pub fn playback(
-    receiver: Receiver<SampleFormat>,
-    rate: usize,
-    buffer: usize,
-) -> anyhow::Result<()> {
-    initialize_mta().unwrap();
+/// WASAPI errors are not `Send + Sync`, so they can't `?` into anyhow directly.
+fn checked<T, E: std::fmt::Display>(result: Result<T, E>) -> anyhow::Result<T> {
+    result.map_err(|e| anyhow::anyhow!("{}", e))
+}
 
-    let channels = 2;
-    let device = get_default_device(&Direction::Render).unwrap();
-    let mut audio_client = device.get_iaudioclient().unwrap();
-    let desired_format = WaveFormat::new(32, 32, &SampleType::Int, rate, channels, None);
+pub fn playback<S: Sample>(
+    receiver: Receiver<S>,
+    rate: usize,
+    _buffer: usize,
+) -> anyhow::Result<()> {
+    checked(initialize_mta())?;
+
+    let channels = CHANNELS;
+    let device = checked(get_default_device(&Direction::Render))?;
+    let mut audio_client = checked(device.get_iaudioclient())?;
+    let desired_format = WaveFormat::new(S::BITS, S::BITS, &SampleType::Int, rate, channels, None);
 
     // Check if the desired format is supported.
     // Since we have convert = true in the initialize_client call later,
@@ -41,29 +44,29 @@ pub fn playback(
     let blockalign = desired_format.get_blockalign();
     println!("Desired playback format: {:?}", desired_format);
 
-    let (def_time, min_time) = audio_client.get_periods().unwrap();
+    let (def_time, min_time) = checked(audio_client.get_periods())?;
     println!("default period {}, min period {}", def_time, min_time);
 
-    audio_client
-        .initialize_client(
-            &desired_format,
-            def_time as i64,
-            &Direction::Render,
-            &ShareMode::Shared,
-            true,
-        )
-        .unwrap();
+    checked(audio_client.initialize_client(
+        &desired_format,
+        def_time as i64,
+        &Direction::Render,
+        &ShareMode::Shared,
+        true,
+    ))?;
     println!("initialized playback");
 
-    let h_event = audio_client.set_get_eventhandle().unwrap();
+    let h_event = checked(audio_client.set_get_eventhandle())?;
 
-    let render_client = audio_client.get_audiorenderclient().unwrap();
+    let render_client = checked(audio_client.get_audiorenderclient())?;
 
-    let mut buf = vec![0u8; 16384];
+    // The device buffer can be much larger than the old fixed 16 KiB.
+    let max_frames = checked(audio_client.get_bufferframecount())? as usize;
+    let mut buf = vec![0u8; max_frames * blockalign as usize];
 
     println!("started");
 
-    audio_client.start_stream().unwrap();
+    checked(audio_client.start_stream())?;
 
     let mut flipped = false;
 
@@ -72,31 +75,29 @@ pub fn playback(
             return Ok(());
         }
 
-        let buffer_frame_count = audio_client.get_available_space_in_frames().unwrap();
+        let buffer_frame_count = checked(audio_client.get_available_space_in_frames())?;
 
-        let size = buffer_frame_count as usize * blockalign as usize;
+        let size = (buffer_frame_count as usize * blockalign as usize).min(buf.len());
 
-        for samples in buf[..size].chunks_exact_mut(SAMPLE_BYTES) {
+        for samples in buf[..size].chunks_exact_mut(S::BYTES) {
             if receiver.is_empty() || flipped {
                 flipped = !flipped;
                 samples.iter_mut().for_each(|x| *x = 0);
             } else {
-                LittleEndian::write_i32(samples, receiver.recv()?);
+                receiver.recv()?.write_le(samples);
             }
         }
 
-        render_client
-            .write_to_device(
-                buffer_frame_count as usize,
-                blockalign as usize,
-                &buf[..size],
-                None,
-            )
-            .unwrap();
+        checked(render_client.write_to_device(
+            buffer_frame_count as usize,
+            blockalign as usize,
+            &buf[..size],
+            None,
+        ))?;
 
         if h_event.wait_for_event(2000).is_err() {
             eprintln!("error, stopping playback");
-            audio_client.stop_stream().unwrap();
+            let _ = audio_client.stop_stream();
             break;
         }
     }
